@@ -1,7 +1,6 @@
 #include <mpi.h>
 #include <pthread.h>
 #include <cstdlib>
-#include <ctime>
 #include <cmath>
 
 constexpr int SUCCESS = 0;
@@ -12,8 +11,8 @@ constexpr int NEED_TASKS = 4;
 constexpr int TURN_OFF = 5;
 
 constexpr int TASKS_IN_LIST = 200;
-constexpr int L = 1000;
-constexpr int ITERATION = 16;
+constexpr int L = 1500;
+constexpr int ITERATION = 240;
 
 typedef struct Task {
   int repeatNum;
@@ -87,7 +86,7 @@ void *routineSenderThread(void *processSharedDataArg) {
 void *routineExecutorThread(void *processSharedDataArg) {
   MPI_Barrier(MPI_COMM_WORLD);
   auto *psd = (ProcessSharedData *) processSharedDataArg;
-  struct timespec start{}, end{};
+  double start, end;
   psd->iterCounter = 0;
   while (psd->iterCounter < ITERATION) {
     int countOfFinishedTasks = 0;
@@ -96,7 +95,7 @@ void *routineExecutorThread(void *processSharedDataArg) {
     psd->curTaskNum = 0;
     generateTaskList(psd);
     pthread_mutex_unlock(&psd->mutex);
-    clock_gettime(CLOCK_MONOTONIC, &start);
+    start = MPI_Wtime();
     while (hasTasks) {
       pthread_mutex_lock(&psd->mutex);
       if (psd->curTaskNum < psd->taskListSize) {
@@ -120,9 +119,8 @@ void *routineExecutorThread(void *processSharedDataArg) {
         }
       }
     }
-    clock_gettime(CLOCK_MONOTONIC, &end);
-    double timeTaken =
-            (double) end.tv_sec - (double) start.tv_sec + 0.000000001 * (double) (end.tv_nsec - start.tv_nsec);
+    end = MPI_Wtime();
+    double timeTaken = end - start;
     double minTime, maxTime;
     MPI_Reduce(&timeTaken, &minTime, 1, MPI_DOUBLE, MPI_MIN, 0, MPI_COMM_WORLD);
     MPI_Reduce(&timeTaken, &maxTime, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
@@ -166,15 +164,16 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  struct timespec startGlobal{}, endGlobal{};
-  if (processSharedData.procRank == 0) {
-    clock_gettime(CLOCK_MONOTONIC, &startGlobal);
-  }
+
   if (pthread_create(&threads_id[0], &attrs, routineSenderThread, &processSharedData) != 0 ||
       pthread_create(&threads_id[1], &attrs, routineExecutorThread, &processSharedData) != 0) {
     MPI_Finalize();
     std::cerr << "Unable to create a thread in process: " << processSharedData.procRank << std::endl;
     return 1;
+  }
+  double start, end;
+  if (processSharedData.procRank == 0) {
+    start = MPI_Wtime();
   }
 
   for (auto thread: threads_id) {
@@ -186,10 +185,8 @@ int main(int argc, char **argv) {
   }
 
   if (processSharedData.procRank == 0) {
-    clock_gettime(CLOCK_MONOTONIC, &endGlobal);
-    double timeTaken =
-            (double) endGlobal.tv_sec - (double) startGlobal.tv_sec +
-            0.000000001 * (double) (endGlobal.tv_nsec - startGlobal.tv_nsec);
+    end = MPI_Wtime();
+    double timeTaken = end - start;
     std::cout << "Summary disbalance: " << processSharedData.summaryDisbalance / (ITERATION) * 100 << std::endl;
     std::cout << "Global time: " << timeTaken << std::endl;
   }
