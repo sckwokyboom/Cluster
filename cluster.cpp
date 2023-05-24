@@ -2,6 +2,7 @@
 #include <pthread.h>
 #include <cstdlib>
 #include <cmath>
+#include <vector>
 
 constexpr int SUCCESS = 0;
 constexpr int FAIL = 1;
@@ -10,12 +11,12 @@ constexpr int ANSWER_TAG = 3;
 constexpr int NEED_TASKS = 4;
 constexpr int TURN_OFF = 5;
 
-constexpr int TASKS_IN_LIST = 200;
+constexpr int TASKS_IN_LIST = 470;
 constexpr int L = 1500;
-constexpr int ITERATION = 240;
+constexpr int ITERATION = 5;
 
 typedef struct Task {
-  int repeatNum;
+  long repeatNum;
 } Task;
 
 struct ProcessSharedData {
@@ -26,16 +27,17 @@ struct ProcessSharedData {
   int taskListSize = 0;
   double globalRes = 0;
   double summaryDisbalance = 0;
-  Task taskList[TASKS_IN_LIST] = {0};
+  std::vector<Task> taskList;
   pthread_mutex_t mutex = {0};
 };
 
 void generateTaskList(ProcessSharedData *psd) {
   psd->taskListSize = TASKS_IN_LIST;
   for (int i = psd->procRank * TASKS_IN_LIST; i < (psd->procRank + 1) * TASKS_IN_LIST; i++) {
-    psd->taskList[i % TASKS_IN_LIST].repeatNum =
-            abs(TASKS_IN_LIST / 2 - i % TASKS_IN_LIST) *
-            abs(psd->procRank - (psd->iterCounter % psd->commSize)) * L;
+    long repeatNum = std::abs(TASKS_IN_LIST / 2 - i % TASKS_IN_LIST)
+                     * std::abs(psd->procRank + 1 - (psd->iterCounter % psd->commSize)) * L;
+    psd->taskList[i % TASKS_IN_LIST].repeatNum = std::abs(repeatNum);
+
   }
 }
 
@@ -43,7 +45,9 @@ int getTaskFrom(int from, ProcessSharedData *psd) {
   int flag = NEED_TASKS;
   MPI_Send(&flag, 1, MPI_INT, from, REQUEST_TAG, MPI_COMM_WORLD);
   MPI_Recv(&flag, 1, MPI_INT, from, ANSWER_TAG, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-  if (flag == FAIL) return FAIL;
+  if (flag == FAIL) {
+    return FAIL;
+  }
   Task receiveTask;
   MPI_Recv(&receiveTask, 1, MPI_INT, from, ANSWER_TAG, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
   pthread_mutex_lock(&psd->mutex);
@@ -54,13 +58,13 @@ int getTaskFrom(int from, ProcessSharedData *psd) {
 }
 
 void doTask(Task task, ProcessSharedData *psd) {
-  for (int i = 0; i < task.repeatNum; i++) {
+  for (long i = 0; i < task.repeatNum; i++) {
     psd->globalRes += sin(i);
   }
 }
 
 void *routineSenderThread(void *processSharedDataArg) {
-  auto *psd = (ProcessSharedData *) processSharedDataArg;
+  auto *psd = static_cast<ProcessSharedData *> (processSharedDataArg);
   int flag;
   while (psd->iterCounter < ITERATION) {
     MPI_Status status;
@@ -85,7 +89,7 @@ void *routineSenderThread(void *processSharedDataArg) {
 
 void *routineExecutorThread(void *processSharedDataArg) {
   MPI_Barrier(MPI_COMM_WORLD);
-  auto *psd = (ProcessSharedData *) processSharedDataArg;
+  auto *psd = static_cast<ProcessSharedData *> (processSharedDataArg);
   double start, end;
   psd->iterCounter = 0;
   while (psd->iterCounter < ITERATION) {
@@ -130,7 +134,6 @@ void *routineExecutorThread(void *processSharedDataArg) {
     MPI_Barrier(MPI_COMM_WORLD);
     psd->iterCounter++;
   }
-
   int flag = TURN_OFF;
   MPI_Send(&flag, 1, MPI_INT, psd->procRank, REQUEST_TAG, MPI_COMM_WORLD);
   return nullptr;
@@ -142,57 +145,63 @@ int main(int argc, char **argv) {
   if (isMultithreadingProvided != MPI_THREAD_MULTIPLE) {
     MPI_Finalize();
     std::cerr << "Unable to init MPI with MPI_THREAD_MULTIPLE level support" << std::endl;
-    return 1;
+    return 0;
   }
 
-  ProcessSharedData processSharedData = ProcessSharedData();
-  MPI_Comm_rank(MPI_COMM_WORLD, &processSharedData.procRank);
-  MPI_Comm_size(MPI_COMM_WORLD, &processSharedData.commSize);
+  auto *psd = new ProcessSharedData();
+  MPI_Comm_rank(MPI_COMM_WORLD, &psd->procRank);
+  MPI_Comm_size(MPI_COMM_WORLD, &psd->commSize);
+  psd->taskList = std::vector<Task>(psd->commSize * TASKS_IN_LIST);
   pthread_t threads_id[2];
-  pthread_mutex_init(&processSharedData.mutex, nullptr);
+  pthread_mutex_init(&psd->mutex, nullptr);
   pthread_attr_t attrs;
 
   if (pthread_attr_init(&attrs) != 0) {
+    delete psd;
     MPI_Finalize();
-    std::cerr << "Unable to initialize attributes in process: " << processSharedData.procRank << std::endl;
-    return 1;
+    std::cerr << "Unable to initialize attributes in process: " << psd->procRank << std::endl;
+    return 0;
   }
 
   if (pthread_attr_setdetachstate(&attrs, PTHREAD_CREATE_JOINABLE) != 0) {
+    delete psd;
     MPI_Finalize();
-    std::cerr << "Error in setting attributes in process: " << processSharedData.procRank << std::endl;
-    return 1;
+    std::cerr << "Error in setting attributes in process: " << psd->procRank << std::endl;
+    return 0;
   }
 
-
-  if (pthread_create(&threads_id[0], &attrs, routineSenderThread, &processSharedData) != 0 ||
-      pthread_create(&threads_id[1], &attrs, routineExecutorThread, &processSharedData) != 0) {
+  if (pthread_create(&threads_id[0], &attrs, routineSenderThread, psd) != 0 ||
+      pthread_create(&threads_id[1], &attrs, routineExecutorThread, psd) != 0) {
+    delete psd;
     MPI_Finalize();
-    std::cerr << "Unable to create a thread in process: " << processSharedData.procRank << std::endl;
-    return 1;
+    std::cerr << "Unable to create a thread in process: " << psd->procRank << std::endl;
+    return 0;
   }
   double start, end;
-  if (processSharedData.procRank == 0) {
+  if (psd->procRank == 0) {
     start = MPI_Wtime();
   }
 
+
   for (auto thread: threads_id) {
     if (pthread_join(thread, nullptr) != 0) {
+      delete psd;
       MPI_Finalize();
-      std::cerr << "Unable to join a thread in process: " << processSharedData.procRank << std::endl;
-      return 1;
+      std::cerr << "Unable to join a thread in process: " << psd->procRank << std::endl;
+      return 0;
     }
   }
 
-  if (processSharedData.procRank == 0) {
+  if (psd->procRank == 0) {
     end = MPI_Wtime();
     double timeTaken = end - start;
-    std::cout << "Summary disbalance: " << processSharedData.summaryDisbalance / (ITERATION) * 100 << std::endl;
+    std::cout << "Summary disbalance: " << psd->summaryDisbalance / (ITERATION) * 100 << std::endl;
     std::cout << "Global time: " << timeTaken << std::endl;
   }
 
   pthread_attr_destroy(&attrs);
-  pthread_mutex_destroy(&processSharedData.mutex);
+  pthread_mutex_destroy(&psd->mutex);
+  delete psd;
   MPI_Finalize();
   return 0;
 }
